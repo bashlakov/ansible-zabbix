@@ -1,0 +1,157 @@
+#!/usr/bin/env python
+
+# (c) 2016, Andrey Bashlakov
+#
+# This file is part of Ansible,
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+######################################################################
+
+
+"""
+Zabbix Server extended external inventory script.
+========================================
+
+Returns hosts, hostgroups, templates and interpret groupvars and hostvars from Zabbix Template's and Host's description
+as YAML.
+
+Configuration is read from `zabbix.ini`.
+
+Tested with Zabbix Server 3.0, 3.2.
+"""
+
+from __future__ import print_function
+import os
+import sys
+import ConfigParser
+import yaml
+import json
+
+
+try:
+    from zabbix_api import ZabbixAPI
+except:
+    print("Error: Zabbix API library must be installed: pip install zabbix-api.", file=sys.stderr)
+    sys.exit(1)
+
+
+class ZabbixInventory(object):
+    def read_settings(self):
+        try:
+            config = ConfigParser.SafeConfigParser()
+            conf_path = './zabbix_extended.ini'
+            if not os.path.exists(conf_path):
+                conf_path = os.path.dirname(os.path.realpath(__file__)) + '/zabbix_extended.ini'
+            if os.path.exists(conf_path):
+                config.read(conf_path)
+
+            self.zabbix_server = config.get('zabbix', 'server')
+            self.zabbix_username = config.get('zabbix', 'username')
+            self.zabbix_password = config.get('zabbix', 'password')
+            self.zabbix_template_prefix = config.get('zabbix', 'template_prefix').strip('"')
+            self.zabbix_hostgroup_prefix = config.get('zabbix', 'hostgroup_prefix').strip('"')
+            self.zabbix_ignore_groups = config.get('zabbix', 'ignore_groups')
+            self.zabbix_ignore_templates = config.get('zabbix', 'ignore_templates')
+        except:
+            print("Error parsing config. See sample zabbix.ini", file=sys.stderr)
+            sys.exit(1)
+
+    def get_list(self, api):
+        try:
+            hostgroups = api.hostgroup.get({'output': ['name'], 'selectHosts': ['host', 'name'],
+                                            'selectTemplates': ['name']})
+
+            templates = api.template.get({'output': ['name', 'description'], 'selectTemplates': ['name'],
+                                          'selectHosts': ['name']})
+
+            hosts = api.host.get({'output': ['name', 'host', 'description', 'proxy_hostid'],
+                                  'selectInterfaces': ['ip', 'useip', 'dns', 'type']})
+        except:
+            print("Error: Couldn't retrieve information from Zabbix server, check connection config", file=sys.stderr)
+            sys.exit(1)
+
+        result = dict()
+        result['_meta'] = dict()
+        result['_meta']['hostvars'] = dict()
+        ignored_host_ids = set()
+
+        for ignore_hosts in (hostgroup['hosts'] for hostgroup in hostgroups if hostgroup['name'] in self.zabbix_ignore_groups):
+            ignored_host_ids.update(host['hostid'] for host in ignore_hosts)
+        for ignore_hosts in (template['hosts'] for template in templates if template['name'] in self.zabbix_ignore_templates):
+            ignored_host_ids.update(host['hostid'] for host in ignore_hosts)
+
+        for hostgroup in hostgroups:
+            if hostgroup['name'] not in self.zabbix_ignore_groups:
+                content = dict()
+                content['children'] = list()
+                for template in hostgroup['templates']:
+                    content['children'].append(self.zabbix_template_prefix + template['name'])
+                content['hosts'] = list((host['name'] for host in hostgroup['hosts']
+                                         if host['hostid'] not in ignored_host_ids))
+                result[self.zabbix_hostgroup_prefix + hostgroup['name']] = content
+
+        for template in templates:
+            if template['name'] not in self.zabbix_ignore_templates:
+                content = dict()
+                content['children'] = list()
+                for child_template in template['templates']:
+                    content['children'].append(self.zabbix_template_prefix + child_template['name'])
+                content['hosts'] = list((host['name'] for host in template['hosts']
+                                         if host['hostid'] not in ignored_host_ids))
+                if template['description']:
+                    try:
+                        variables = yaml.safe_load(template['description'])
+                        if variables:
+                            content['vars'] = variables
+                    except:
+                        pass
+                result[self.zabbix_template_prefix + template['name']] = content
+            else:
+                ignored_host_ids.update(host['hostid'] for host in template['hosts'])
+
+        for host in (host for host in hosts if host['hostid'] not in ignored_host_ids):
+            variables = dict()
+            for interface in host['interfaces']:
+                if interface['type'] == '1':
+                    if interface['useip'] == '0':
+                        variables['ansible_host'] = interface['dns']
+                    else:
+                        variables['ansible_host'] = interface['ip']
+            variables['zabbix_proxy_id'] = host['proxy_hostid']
+            if host['description']:
+                try:
+                    variables.update(yaml.load(host['description']))
+                except:
+                    pass
+            result['_meta']['hostvars'][host['name']] = variables
+
+        return result
+
+    def __init__(self):
+
+        self.read_settings()
+
+        try:
+            api = ZabbixAPI(server=self.zabbix_server)
+            api.login(user=self.zabbix_username, password=self.zabbix_password)
+        except:
+            print("Error: Could not login to Zabbix server. Check your zabbix.ini.", file=sys.stderr)
+            sys.exit(1)
+
+        data = self.get_list(api)
+        print(json.dumps(data, indent=2))
+
+if __name__ == '__main__':
+    ZabbixInventory()
